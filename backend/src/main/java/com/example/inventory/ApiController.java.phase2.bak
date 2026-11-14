@@ -1,0 +1,209 @@
+package com.example.inventory;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/api")
+@CrossOrigin(origins = "*")
+public class ApiController {
+    private final JdbcTemplate db;
+
+    public ApiController(JdbcTemplate db) {
+        this.db = db;
+    }
+
+    @GetMapping("/health")
+    public Map<String, String> health() {
+        return Map.of("status", "ok");
+    }
+
+    @GetMapping("/categories")
+    public List<Map<String, Object>> categories() {
+        return db.queryForList("SELECT id, name FROM categories ORDER BY name");
+    }
+
+    @GetMapping("/products")
+    public List<Map<String, Object>> products() {
+        return db.queryForList("""
+            SELECT p.id, p.sku, p.name, p.category_id,
+                   c.name AS category, p.price,
+                   COALESCE(SUM(i.quantity), 0) AS stock
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            LEFT JOIN inventory i ON i.product_id = p.id
+            GROUP BY p.id, c.name
+            ORDER BY p.id
+            """);
+    }
+
+    @GetMapping("/customers")
+    public List<Map<String, Object>> customers() {
+        return db.queryForList("SELECT * FROM customers ORDER BY id");
+    }
+
+    @GetMapping("/warehouses")
+    public List<Map<String, Object>> warehouses() {
+        return db.queryForList("SELECT * FROM warehouses ORDER BY id");
+    }
+
+    @GetMapping("/orders")
+    public List<Map<String, Object>> orders() {
+        return db.queryForList("""
+            SELECT o.id, o.customer_id, c.name AS customer, o.status,
+                   o.total, o.created_at
+            FROM orders o
+            JOIN customers c ON c.id = o.customer_id
+            ORDER BY o.id DESC
+            """);
+    }
+
+    @GetMapping("/dashboard")
+    public Map<String, Object> dashboard() {
+        return Map.of(
+            "products", db.queryForObject("SELECT COUNT(*) FROM products", Long.class),
+            "orders", db.queryForObject("SELECT COUNT(*) FROM orders", Long.class),
+            "unitsInStock", db.queryForObject("SELECT COALESCE(SUM(quantity),0) FROM inventory", Long.class),
+            "revenue", db.queryForObject(
+                "SELECT COALESCE(SUM(total),0) FROM orders WHERE status <> 'CANCELLED'",
+                BigDecimal.class
+            )
+        );
+    }
+
+    public record ProductRequest(String sku, String name, Long categoryId, BigDecimal price) {}
+
+    private void validateProduct(ProductRequest p) {
+        if (p == null || p.sku() == null || p.sku().isBlank()
+                || p.name() == null || p.name().isBlank()
+                || p.categoryId() == null || p.price() == null
+                || p.price().signum() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Enter a SKU, name, category and valid price.");
+        }
+        Integer categoryExists = db.queryForObject(
+            "SELECT COUNT(*) FROM categories WHERE id = ?", Integer.class, p.categoryId()
+        );
+        if (categoryExists == null || categoryExists == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Selected category does not exist.");
+        }
+    }
+
+    @PostMapping("/products")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Transactional
+    public Map<String, Object> addProduct(@RequestBody ProductRequest p) {
+        validateProduct(p);
+        try {
+            Map<String, Object> created = db.queryForMap("""
+                INSERT INTO products(sku, name, category_id, price)
+                VALUES (?, ?, ?, ?)
+                RETURNING id, sku, name, category_id, price
+                """, p.sku().trim(), p.name().trim(), p.categoryId(), p.price());
+            db.update("""
+                INSERT INTO inventory(product_id, warehouse_id, quantity)
+                SELECT ?, id, 0 FROM warehouses
+                ON CONFLICT DO NOTHING
+                """, created.get("id"));
+            return created;
+        } catch (DuplicateKeyException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "That SKU is already in use.");
+        }
+    }
+
+    @PutMapping("/products/{id}")
+    @Transactional
+    public Map<String, Object> updateProduct(@PathVariable long id, @RequestBody ProductRequest p) {
+        validateProduct(p);
+        Integer exists = db.queryForObject("SELECT COUNT(*) FROM products WHERE id = ?", Integer.class, id);
+        if (exists == null || exists == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found.");
+        }
+        try {
+            db.update("""
+                UPDATE products
+                SET sku = ?, name = ?, category_id = ?, price = ?
+                WHERE id = ?
+                """, p.sku().trim(), p.name().trim(), p.categoryId(), p.price(), id);
+            return db.queryForMap("""
+                SELECT p.id, p.sku, p.name, p.category_id, c.name AS category, p.price
+                FROM products p JOIN categories c ON c.id = p.category_id
+                WHERE p.id = ?
+                """, id);
+        } catch (DuplicateKeyException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "That SKU is already in use.");
+        }
+    }
+
+    @DeleteMapping("/products/{id}")
+    @Transactional
+    public Map<String, Object> deleteProduct(@PathVariable long id) {
+        Integer exists = db.queryForObject("SELECT COUNT(*) FROM products WHERE id = ?", Integer.class, id);
+        if (exists == null || exists == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found.");
+        }
+        Integer usedInOrders = db.queryForObject(
+            "SELECT COUNT(*) FROM order_items WHERE product_id = ?", Integer.class, id
+        );
+        if (usedInOrders != null && usedInOrders > 0) {
+            throw new ResponseStatusException(
+                HttpStatus.CONFLICT,
+                "This product is linked to order history and cannot be deleted. You can edit its details instead."
+            );
+        }
+        db.update("DELETE FROM inventory WHERE product_id = ?", id);
+        db.update("DELETE FROM products WHERE id = ?", id);
+        return Map.of("deleted", true, "id", id);
+    }
+
+    public record NewOrder(Long customerId, Long productId, Long warehouseId, Integer quantity) {}
+
+    @PostMapping("/orders")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Transactional
+    public Map<String, Object> createOrder(@RequestBody NewOrder o) {
+        if (o.customerId() == null || o.productId() == null || o.warehouseId() == null
+                || o.quantity() == null || o.quantity() <= 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid order.");
+        }
+        List<Map<String, Object>> rows = db.queryForList("""
+            SELECT quantity FROM inventory
+            WHERE product_id = ? AND warehouse_id = ?
+            FOR UPDATE
+            """, o.productId(), o.warehouseId());
+        if (rows.isEmpty() || ((Number) rows.get(0).get("quantity")).intValue() < o.quantity()) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Insufficient inventory.");
+        }
+        BigDecimal price;
+        try {
+            price = db.queryForObject("SELECT price FROM products WHERE id = ?", BigDecimal.class, o.productId());
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Product not found.");
+        }
+        Integer customerExists = db.queryForObject(
+            "SELECT COUNT(*) FROM customers WHERE id = ?", Integer.class, o.customerId()
+        );
+        if (customerExists == null || customerExists == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Customer not found.");
+        }
+        BigDecimal total = price.multiply(BigDecimal.valueOf(o.quantity()));
+        db.update("UPDATE inventory SET quantity = quantity - ? WHERE product_id = ? AND warehouse_id = ?",
+            o.quantity(), o.productId(), o.warehouseId());
+        Long id = db.queryForObject(
+            "INSERT INTO orders(customer_id, total) VALUES (?, ?) RETURNING id",
+            Long.class, o.customerId(), total
+        );
+        db.update("""
+            INSERT INTO order_items(order_id, product_id, warehouse_id, quantity, unit_price)
+            VALUES (?, ?, ?, ?, ?)
+            """, id, o.productId(), o.warehouseId(), o.quantity(), price);
+        return Map.of("id", id, "total", total, "status", "PENDING");
+    }
+}

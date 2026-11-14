@@ -1,0 +1,187 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import './style.css';
+
+const API = '/api';
+type Product = { id: number; sku: string; name: string; category_id: number; category: string; price: number; stock: number };
+type Category = { id: number; name: string };
+type Warehouse = { id: number; name: string; location: string };
+type InventoryRow = { product_id: number; sku: string; product: string; warehouse_id: number; warehouse: string; location: string; quantity: number; low_stock: boolean };
+type Order = { id: number; customer: string; status: string; total: number };
+type ProductForm = { sku: string; name: string; categoryId: string; price: string };
+const emptyForm: ProductForm = { sku: '', name: '', categoryId: '', price: '' };
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    let message = body;
+    try { const parsed = JSON.parse(body); message = parsed.detail || parsed.message || body; } catch { /* plain text */ }
+    throw new Error(message || `Request failed (${response.status})`);
+  }
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+function App() {
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
+  const [inventory, setInventory] = useState<InventoryRow[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [stats, setStats] = useState<Record<string, number>>({});
+  const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [form, setForm] = useState<ProductForm>(emptyForm);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  const [stockProduct, setStockProduct] = useState('');
+  const [stockWarehouse, setStockWarehouse] = useState('');
+  const [stockQuantity, setStockQuantity] = useState('10');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+
+  const load = async () => {
+    try {
+      const [p, c, w, i, o, d] = await Promise.all([
+        request<Product[]>('/products'), request<Category[]>('/categories'),
+        request<Warehouse[]>('/warehouses'), request<InventoryRow[]>('/inventory'),
+        request<Order[]>('/orders'), request<Record<string, number>>('/dashboard'),
+      ]);
+      setProducts(p); setCategories(c); setWarehouses(w); setInventory(i); setOrders(o); setStats(d);
+      setStockProduct((old) => old || (p[0] ? String(p[0].id) : ''));
+      setStockWarehouse((old) => old || (w[0] ? String(w[0].id) : ''));
+      setError('');
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  useEffect(() => { void load(); }, []);
+
+  const visibleProducts = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    return products.filter((p) => {
+      const textMatch = !term || [p.sku, p.name, p.category].some((v) => v.toLowerCase().includes(term));
+      return textMatch && (categoryFilter === 'all' || String(p.category_id) === categoryFilter);
+    });
+  }, [products, search, categoryFilter]);
+
+  const openAdd = () => {
+    setEditingId(null); setForm({ ...emptyForm, categoryId: categories[0] ? String(categories[0].id) : '' });
+    setShowForm(true); setError(''); setMessage('');
+  };
+  const openEdit = (p: Product) => {
+    setEditingId(p.id); setForm({ sku: p.sku, name: p.name, categoryId: String(p.category_id), price: String(p.price) });
+    setShowForm(true); setError(''); setMessage('');
+  };
+  const saveProduct = async (event: React.FormEvent) => {
+    event.preventDefault(); setBusy(true); setError(''); setMessage('');
+    try {
+      const payload = { sku: form.sku.trim(), name: form.name.trim(), categoryId: Number(form.categoryId), price: Number(form.price) };
+      if (!payload.sku || !payload.name || !payload.categoryId || !Number.isFinite(payload.price) || payload.price < 0) throw new Error('Please complete all fields and enter a valid non-negative price.');
+      if (editingId === null) {
+        await request('/products', { method: 'POST', body: JSON.stringify(payload) });
+        setMessage('Product added successfully. Set its stock below.');
+      } else {
+        await request(`/products/${editingId}`, { method: 'PUT', body: JSON.stringify(payload) });
+        setMessage('Product updated successfully.');
+      }
+      setShowForm(false); setForm(emptyForm); await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const deleteProduct = async (p: Product) => {
+    if (!window.confirm(`Delete "${p.name}"? Products already used in orders cannot be deleted.`)) return;
+    setBusy(true); setError(''); setMessage('');
+    try { await request(`/products/${p.id}`, { method: 'DELETE' }); setMessage(`${p.name} deleted.`); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const placeOrder = async (p: Product) => {
+    setBusy(true); setError(''); setMessage('');
+    try {
+      await request('/orders', { method: 'POST', body: JSON.stringify({ customerId: 1, productId: p.id, warehouseId: 1, quantity: 1 }) });
+      setMessage(`Order created for ${p.name}.`); await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const updateStock = async (event: React.FormEvent) => {
+    event.preventDefault(); setBusy(true); setError(''); setMessage('');
+    try {
+      const quantity = Number(stockQuantity);
+      if (!stockProduct || !stockWarehouse || !Number.isInteger(quantity) || quantity < 0) throw new Error('Choose a product and warehouse, and enter a whole number of 0 or more.');
+      const result = await request<InventoryRow>('/inventory', {
+        method: 'PUT', body: JSON.stringify({ productId: Number(stockProduct), warehouseId: Number(stockWarehouse), quantity }),
+      });
+      setMessage(`Stock updated: ${result.product} at ${result.warehouse} now has ${result.quantity} units.`);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const lowStockCount = inventory.filter((row) => row.low_stock).length;
+
+  return <main>
+    <header className="topbar">
+      <div><span className="eyebrow">OPERATIONS / INVENTORY CONTROL</span><h1>Smart Inventory</h1><p>Manage products, monitor stock and keep orders moving.</p></div>
+      <button className="primary add-top" onClick={openAdd}>＋ Add product</button>
+    </header>
+    <section className="stats">
+      <article><small>Total products</small><strong>{stats.products ?? '—'}</strong><span>Catalog items</span></article>
+      <article><small>Total orders</small><strong>{stats.orders ?? '—'}</strong><span>Orders created</span></article>
+      <article><small>Units in stock</small><strong>{stats.unitsInStock ?? '—'}</strong><span>Across warehouses</span></article>
+      <article><small>Low-stock entries</small><strong>{lowStockCount}</strong><span>At or below 5 units</span></article>
+    </section>
+    {error && <div className="notice error">{error}</div>}
+    {message && <div className="notice success">{message}</div>}
+
+    <section className="panel">
+      <div className="section-heading"><div><span className="section-kicker">CATALOG</span><h2>Product management</h2><p>Search, filter, add and maintain your product catalog.</p></div><button className="primary" onClick={openAdd}>＋ New product</button></div>
+      <div className="filters">
+        <input aria-label="Search products" placeholder="Search by name, SKU or category…" value={search} onChange={(e) => setSearch(e.target.value)} />
+        <select aria-label="Filter by category" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}><option value="all">All categories</option>{categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
+        <span className="result-count">{visibleProducts.length} products</span>
+      </div>
+      <div className="scroll"><table><thead><tr><th>SKU</th><th>Product</th><th>Category</th><th>Unit price</th><th>Stock</th><th>Order</th><th>Manage</th></tr></thead>
+        <tbody>{visibleProducts.map((p) => <tr key={p.id}><td><span className="sku">{p.sku}</span></td><td className="product-name">{p.name}</td><td>{p.category}</td><td>${Number(p.price).toFixed(2)}</td><td><span className={p.stock > 5 ? 'stock' : 'stock low'}>{p.stock}</span></td><td><button className="small primary" disabled={busy || p.stock < 1} onClick={() => void placeOrder(p)}>Order 1</button></td><td><div className="actions"><button className="small secondary" disabled={busy} onClick={() => openEdit(p)}>Edit</button><button className="small danger" disabled={busy} onClick={() => void deleteProduct(p)}>Delete</button></div></td></tr>)}
+          {visibleProducts.length === 0 && <tr><td colSpan={7} className="empty">No products match your search.</td></tr>}</tbody></table></div>
+    </section>
+
+    <section className="panel">
+      <div className="section-heading"><div><span className="section-kicker">WAREHOUSE OPERATIONS</span><h2>Inventory management</h2><p>Set on-hand quantities for each product at a warehouse.</p></div></div>
+      <form className="stock-form" onSubmit={updateStock}>
+        <label>Product<select required value={stockProduct} onChange={(e) => setStockProduct(e.target.value)}><option value="">Choose product</option>{products.map((p) => <option key={p.id} value={p.id}>{p.sku} — {p.name}</option>)}</select></label>
+        <label>Warehouse<select required value={stockWarehouse} onChange={(e) => setStockWarehouse(e.target.value)}><option value="">Choose warehouse</option>{warehouses.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}</select></label>
+        <label>New quantity<input required type="number" min="0" step="1" value={stockQuantity} onChange={(e) => setStockQuantity(e.target.value)} /></label>
+        <button className="primary stock-submit" type="submit" disabled={busy || !products.length || !warehouses.length}>Update stock</button>
+      </form>
+      <div className="scroll inventory-table"><table><thead><tr><th>SKU</th><th>Product</th><th>Warehouse</th><th>Location</th><th>Quantity</th><th>Stock status</th></tr></thead>
+        <tbody>{inventory.map((row) => <tr key={`${row.product_id}-${row.warehouse_id}`}><td><span className="sku">{row.sku}</span></td><td className="product-name">{row.product}</td><td>{row.warehouse}</td><td>{row.location || '—'}</td><td>{row.quantity}</td><td><span className={row.low_stock ? 'stock low' : 'stock'}>{row.low_stock ? 'Low stock' : 'Healthy'}</span></td></tr>)}
+          {inventory.length === 0 && <tr><td colSpan={6} className="empty">No inventory records found.</td></tr>}</tbody></table></div>
+      <p className="form-hint">Low stock is defined as 5 units or fewer. Updating stock sets the on-hand quantity to the value entered.</p>
+    </section>
+
+    <section className="panel">
+      <div className="section-heading"><div><span className="section-kicker">FULFILLMENT</span><h2>Recent orders</h2><p>Latest customer orders and their current status.</p></div></div>
+      <div className="scroll"><table><thead><tr><th>Order</th><th>Customer</th><th>Status</th><th>Total</th></tr></thead><tbody>{orders.map((o) => <tr key={o.id}><td>#{o.id}</td><td>{o.customer}</td><td><span className="status">{o.status}</span></td><td>${Number(o.total).toFixed(2)}</td></tr>)}{orders.length === 0 && <tr><td colSpan={4} className="empty">No orders yet.</td></tr>}</tbody></table></div>
+    </section>
+
+    {showForm && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowForm(false); }}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="product-form-title">
+        <div className="modal-heading"><div><span className="section-kicker">PRODUCT CATALOG</span><h2 id="product-form-title">{editingId === null ? 'Add a product' : 'Edit product'}</h2></div><button className="icon-button" aria-label="Close" onClick={() => setShowForm(false)}>×</button></div>
+        <form onSubmit={saveProduct}>
+          <label>SKU<input required maxLength={60} value={form.sku} placeholder="e.g. KB-002" onChange={(e) => setForm({ ...form, sku: e.target.value })} /></label>
+          <label>Product name<input required maxLength={160} value={form.name} placeholder="e.g. Ergonomic Keyboard" onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+          <label>Category<select required value={form.categoryId} onChange={(e) => setForm({ ...form, categoryId: e.target.value })}><option value="">Choose a category</option>{categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
+          <label>Unit price (USD)<input required type="number" min="0" step="0.01" value={form.price} placeholder="0.00" onChange={(e) => setForm({ ...form, price: e.target.value })} /></label>
+          <p className="form-hint">New products start with zero stock. Set their quantity in Inventory Management.</p>
+          <div className="modal-actions"><button type="button" className="secondary" onClick={() => setShowForm(false)}>Cancel</button><button type="submit" className="primary" disabled={busy}>{busy ? 'Saving…' : editingId === null ? 'Create product' : 'Save changes'}</button></div>
+        </form>
+      </section>
+    </div>}
+    <footer>Smart Inventory · Local development environment</footer>
+  </main>;
+}
+createRoot(document.getElementById('root')!).render(<App />);

@@ -1,0 +1,23 @@
+package com.example.inventory;
+import java.math.BigDecimal;
+import java.util.*;
+import org.springframework.http.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.*;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+@RestController @RequestMapping("/api") @CrossOrigin(origins="*") public class ApiController {
+ private final JdbcTemplate db;
+ public ApiController(JdbcTemplate db){this.db=db;}
+ @GetMapping("/health") public Map<String,String> health(){return Map.of("status","ok");}
+ @GetMapping("/products") public List<Map<String,Object>> products(){return db.queryForList("SELECT p.id,p.sku,p.name,p.price,c.name AS category,COALESCE(SUM(i.quantity),0) AS stock FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN inventory i ON i.product_id=p.id GROUP BY p.id,c.name ORDER BY p.id");}
+ @GetMapping("/customers") public List<Map<String,Object>> customers(){return db.queryForList("SELECT * FROM customers ORDER BY id");}
+ @GetMapping("/warehouses") public List<Map<String,Object>> warehouses(){return db.queryForList("SELECT * FROM warehouses ORDER BY id");}
+ @GetMapping("/orders") public List<Map<String,Object>> orders(){return db.queryForList("SELECT o.id,o.customer_id,c.name AS customer,o.status,o.total,o.created_at FROM orders o JOIN customers c ON c.id=o.customer_id ORDER BY o.id DESC");}
+ @GetMapping("/dashboard") public Map<String,Object> dashboard(){return Map.of("products",db.queryForObject("SELECT COUNT(*) FROM products",Long.class),"orders",db.queryForObject("SELECT COUNT(*) FROM orders",Long.class),"unitsInStock",db.queryForObject("SELECT COALESCE(SUM(quantity),0) FROM inventory",Long.class),"revenue",db.queryForObject("SELECT COALESCE(SUM(total),0) FROM orders WHERE status <> 'CANCELLED'",BigDecimal.class));}
+ public record NewProduct(String sku,String name,Long categoryId,BigDecimal price){}
+ @PostMapping("/products") @ResponseStatus(HttpStatus.CREATED) public Map<String,Object> addProduct(@RequestBody NewProduct p){if(p.sku()==null||p.sku().isBlank()||p.name()==null||p.name().isBlank()||p.price()==null||p.price().signum()<0)throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Invalid product");try{return db.queryForMap("INSERT INTO products(sku,name,category_id,price) VALUES (?,?,?,?) RETURNING *",p.sku(),p.name(),p.categoryId(),p.price());}catch(Exception e){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Product could not be created",e);}}
+ public record NewOrder(Long customerId,Long productId,Long warehouseId,Integer quantity){}
+ @PostMapping("/orders") @ResponseStatus(HttpStatus.CREATED) @Transactional public Map<String,Object> createOrder(@RequestBody NewOrder o){if(o.customerId()==null||o.productId()==null||o.warehouseId()==null||o.quantity()==null||o.quantity()<=0)throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Invalid order");List<Map<String,Object>> rows=db.queryForList("SELECT quantity FROM inventory WHERE product_id=? AND warehouse_id=? FOR UPDATE",o.productId(),o.warehouseId());if(rows.isEmpty()||((Number)rows.get(0).get("quantity")).intValue()<o.quantity())throw new ResponseStatusException(HttpStatus.CONFLICT,"Insufficient inventory");BigDecimal price;try{price=db.queryForObject("SELECT price FROM products WHERE id=?",BigDecimal.class,o.productId());}catch(Exception e){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Product not found");}BigDecimal total=price.multiply(BigDecimal.valueOf(o.quantity()));db.update("UPDATE inventory SET quantity=quantity-? WHERE product_id=? AND warehouse_id=?",o.quantity(),o.productId(),o.warehouseId());Long id=db.queryForObject("INSERT INTO orders(customer_id,total) VALUES (?,?) RETURNING id",Long.class,o.customerId(),total);db.update("INSERT INTO order_items(order_id,product_id,warehouse_id,quantity,unit_price) VALUES (?,?,?,?,?)",id,o.productId(),o.warehouseId(),o.quantity(),price);return Map.of("id",id,"total",total,"status","PENDING");}
+}

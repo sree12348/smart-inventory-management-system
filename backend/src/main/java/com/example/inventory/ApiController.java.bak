@@ -1,0 +1,463 @@
+package com.example.inventory;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/api")
+@CrossOrigin(origins = "*")
+public class ApiController {
+    private final JdbcTemplate db;
+
+    public ApiController(JdbcTemplate db) {
+        this.db = db;
+    }
+
+    @GetMapping("/health")
+    public Map<String, String> health() {
+        return Map.of("status", "ok");
+    }
+
+    @GetMapping("/categories")
+    public List<Map<String, Object>> categories() {
+        return db.queryForList("SELECT id, name FROM categories ORDER BY name");
+    }
+
+    @GetMapping("/products")
+    public List<Map<String, Object>> products() {
+        return db.queryForList("""
+            SELECT p.id, p.sku, p.name, p.category_id,
+                   c.name AS category, p.price,
+                   COALESCE(SUM(i.quantity), 0) AS stock
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            LEFT JOIN inventory i ON i.product_id = p.id
+            GROUP BY p.id, c.name
+            ORDER BY p.id
+            """);
+    }
+
+    @GetMapping("/inventory")
+    public List<Map<String, Object>> inventory() {
+        return db.queryForList("""
+            SELECT i.product_id, p.sku, p.name AS product,
+                   i.warehouse_id, w.name AS warehouse, w.location,
+                   i.quantity,
+                   CASE WHEN i.quantity <= 5 THEN TRUE ELSE FALSE END AS low_stock
+            FROM inventory i
+            JOIN products p ON p.id = i.product_id
+            JOIN warehouses w ON w.id = i.warehouse_id
+            ORDER BY w.name, p.name
+            """);
+    }
+
+    @GetMapping("/customers")
+    public List<Map<String, Object>> customers() {
+        return db.queryForList("SELECT id, name, email, address FROM customers ORDER BY name");
+    }
+
+    @GetMapping("/warehouses")
+    public List<Map<String, Object>> warehouses() {
+        return db.queryForList("SELECT * FROM warehouses ORDER BY id");
+    }
+
+    @GetMapping("/orders")
+    public List<Map<String, Object>> orders() {
+        return db.queryForList("""
+            SELECT o.id, o.customer_id, c.name AS customer, o.status,
+                   o.total, o.created_at, COUNT(oi.id) AS item_count
+            FROM orders o
+            JOIN customers c ON c.id = o.customer_id
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id, c.name
+            ORDER BY o.id DESC
+            """);
+    }
+
+    @GetMapping("/orders/{id}")
+    public Map<String, Object> orderDetails(@PathVariable long id) {
+        List<Map<String, Object>> headers = db.queryForList("""
+            SELECT o.id, o.customer_id, c.name AS customer, c.email,
+                   o.status, o.total, o.created_at
+            FROM orders o JOIN customers c ON c.id = o.customer_id
+            WHERE o.id = ?
+            """, id);
+        if (headers.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found.");
+        }
+        List<Map<String, Object>> items = db.queryForList("""
+            SELECT oi.id, oi.product_id, p.sku, p.name AS product,
+                   oi.warehouse_id, w.name AS warehouse,
+                   oi.quantity, oi.unit_price,
+                   (oi.quantity * oi.unit_price) AS line_total
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            JOIN warehouses w ON w.id = oi.warehouse_id
+            WHERE oi.order_id = ?
+            ORDER BY oi.id
+            """, id);
+        return Map.of("order", headers.get(0), "items", items);
+    }
+
+    @GetMapping("/payments")
+    public List<Map<String, Object>> payments() {
+        return db.queryForList("""
+            SELECT p.id, p.order_id, c.name AS customer, p.amount, p.status,
+                   p.payment_method, p.transaction_reference, p.created_at, p.paid_at
+            FROM payments p JOIN orders o ON o.id = p.order_id
+            JOIN customers c ON c.id = o.customer_id
+            ORDER BY p.order_id DESC
+            """);
+    }
+
+    @GetMapping("/shipments")
+    public List<Map<String, Object>> shipments() {
+        return db.queryForList("""
+            SELECT s.id, s.order_id, c.name AS customer, s.status,
+                   s.tracking_number, s.carrier, s.shipped_at,
+                   s.estimated_delivery, s.delivered_at, s.updated_at
+            FROM shipments s JOIN orders o ON o.id = s.order_id
+            JOIN customers c ON c.id = o.customer_id
+            ORDER BY s.order_id DESC
+            """);
+    }
+
+    public record PaymentUpdate(String paymentMethod, String transactionReference) {}
+
+    @PutMapping("/payments/{orderId}")
+    @Transactional
+    public Map<String, Object> updatePayment(@PathVariable long orderId, @RequestBody PaymentUpdate update) {
+        if (update == null || update.paymentMethod() == null || update.paymentMethod().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Choose a payment method.");
+        }
+        List<Map<String, Object>> rows = db.queryForList(
+            "SELECT status FROM payments WHERE order_id = ? FOR UPDATE", orderId);
+        if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Payment record not found.");
+        String status = String.valueOf(rows.get(0).get("status"));
+        if (!"PAID".equals(status)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Payment details can only be added to a paid order.");
+        }
+        db.update("""
+            UPDATE payments SET payment_method = ?, transaction_reference = ? WHERE order_id = ?
+            """, update.paymentMethod().trim().toUpperCase(),
+            update.transactionReference() == null || update.transactionReference().isBlank() ? null : update.transactionReference().trim(),
+            orderId);
+        return db.queryForMap("SELECT * FROM payments WHERE order_id = ?", orderId);
+    }
+
+    public record ShipmentUpdate(String trackingNumber, String carrier, java.time.LocalDate estimatedDelivery) {}
+
+    @PutMapping("/shipments/{orderId}")
+    @Transactional
+    public Map<String, Object> updateShipment(@PathVariable long orderId, @RequestBody ShipmentUpdate update) {
+        if (update == null || update.carrier() == null || update.carrier().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Enter a shipping carrier.");
+        }
+        List<Map<String, Object>> rows = db.queryForList(
+            "SELECT status FROM shipments WHERE order_id = ? FOR UPDATE", orderId);
+        if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Shipment record not found.");
+        String status = String.valueOf(rows.get(0).get("status"));
+        if (!"SHIPPED".equals(status)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Tracking details can only be added after an order is shipped.");
+        }
+        try {
+            db.update("""
+                UPDATE shipments SET tracking_number = ?, carrier = ?, estimated_delivery = ?, updated_at = NOW()
+                WHERE order_id = ?
+                """, update.trackingNumber() == null || update.trackingNumber().isBlank() ? null : update.trackingNumber().trim(),
+                update.carrier().trim(), update.estimatedDelivery(), orderId);
+        } catch (DuplicateKeyException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "That tracking number is already assigned to another shipment.");
+        }
+        return db.queryForMap("SELECT * FROM shipments WHERE order_id = ?", orderId);
+    }
+
+    @PatchMapping("/shipments/{orderId}/deliver")
+    @Transactional
+    public Map<String, Object> markDelivered(@PathVariable long orderId) {
+        List<Map<String, Object>> rows = db.queryForList(
+            "SELECT status FROM shipments WHERE order_id = ? FOR UPDATE", orderId);
+        if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Shipment record not found.");
+        if (!"SHIPPED".equals(String.valueOf(rows.get(0).get("status")))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only shipped orders can be marked delivered.");
+        }
+        db.update("UPDATE shipments SET status = 'DELIVERED', delivered_at = NOW(), updated_at = NOW() WHERE order_id = ?", orderId);
+        return Map.of("orderId", orderId, "status", "DELIVERED");
+    }
+
+    @GetMapping("/dashboard")
+    public Map<String, Object> dashboard() {
+        return Map.of(
+            "products", db.queryForObject("SELECT COUNT(*) FROM products", Long.class),
+            "orders", db.queryForObject("SELECT COUNT(*) FROM orders", Long.class),
+            "unitsInStock", db.queryForObject("SELECT COALESCE(SUM(quantity),0) FROM inventory", Long.class),
+            "revenue", db.queryForObject(
+                "SELECT COALESCE(SUM(total),0) FROM orders WHERE status <> 'CANCELLED'",
+                BigDecimal.class
+            ),
+            "paidPayments", db.queryForObject("SELECT COUNT(*) FROM payments WHERE status = 'PAID'", Long.class),
+            "pendingPayments", db.queryForObject("SELECT COUNT(*) FROM payments WHERE status = 'PENDING'", Long.class),
+            "shippedOrders", db.queryForObject("SELECT COUNT(*) FROM shipments WHERE status = 'SHIPPED'", Long.class),
+            "deliveredOrders", db.queryForObject("SELECT COUNT(*) FROM shipments WHERE status = 'DELIVERED'", Long.class)
+        );
+    }
+
+    public record ProductRequest(String sku, String name, Long categoryId, BigDecimal price) {}
+
+    private void validateProduct(ProductRequest p) {
+        if (p == null || p.sku() == null || p.sku().isBlank()
+                || p.name() == null || p.name().isBlank()
+                || p.categoryId() == null || p.price() == null
+                || p.price().signum() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Enter a SKU, name, category and valid price.");
+        }
+        Integer categoryExists = db.queryForObject(
+            "SELECT COUNT(*) FROM categories WHERE id = ?", Integer.class, p.categoryId()
+        );
+        if (categoryExists == null || categoryExists == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Selected category does not exist.");
+        }
+    }
+
+    @PostMapping("/products")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Transactional
+    public Map<String, Object> addProduct(@RequestBody ProductRequest p) {
+        validateProduct(p);
+        try {
+            Map<String, Object> created = db.queryForMap("""
+                INSERT INTO products(sku, name, category_id, price)
+                VALUES (?, ?, ?, ?)
+                RETURNING id, sku, name, category_id, price
+                """, p.sku().trim(), p.name().trim(), p.categoryId(), p.price());
+            db.update("""
+                INSERT INTO inventory(product_id, warehouse_id, quantity)
+                SELECT ?, id, 0 FROM warehouses
+                ON CONFLICT DO NOTHING
+                """, created.get("id"));
+            return created;
+        } catch (DuplicateKeyException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "That SKU is already in use.");
+        }
+    }
+
+    @PutMapping("/products/{id}")
+    @Transactional
+    public Map<String, Object> updateProduct(@PathVariable long id, @RequestBody ProductRequest p) {
+        validateProduct(p);
+        Integer exists = db.queryForObject("SELECT COUNT(*) FROM products WHERE id = ?", Integer.class, id);
+        if (exists == null || exists == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found.");
+        }
+        try {
+            db.update("""
+                UPDATE products SET sku = ?, name = ?, category_id = ?, price = ?
+                WHERE id = ?
+                """, p.sku().trim(), p.name().trim(), p.categoryId(), p.price(), id);
+            return db.queryForMap("""
+                SELECT p.id, p.sku, p.name, p.category_id, c.name AS category, p.price
+                FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = ?
+                """, id);
+        } catch (DuplicateKeyException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "That SKU is already in use.");
+        }
+    }
+
+    @DeleteMapping("/products/{id}")
+    @Transactional
+    public Map<String, Object> deleteProduct(@PathVariable long id) {
+        Integer exists = db.queryForObject("SELECT COUNT(*) FROM products WHERE id = ?", Integer.class, id);
+        if (exists == null || exists == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found.");
+        }
+        Integer usedInOrders = db.queryForObject(
+            "SELECT COUNT(*) FROM order_items WHERE product_id = ?", Integer.class, id
+        );
+        if (usedInOrders != null && usedInOrders > 0) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                "This product is linked to order history and cannot be deleted. Edit its details instead.");
+        }
+        db.update("DELETE FROM inventory WHERE product_id = ?", id);
+        db.update("DELETE FROM products WHERE id = ?", id);
+        return Map.of("deleted", true, "id", id);
+    }
+
+    public record StockRequest(Long productId, Long warehouseId, Integer quantity) {}
+
+    @PutMapping("/inventory")
+    @Transactional
+    public Map<String, Object> setStock(@RequestBody StockRequest s) {
+        if (s == null || s.productId() == null || s.warehouseId() == null
+                || s.quantity() == null || s.quantity() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                "Enter a product, warehouse and non-negative quantity.");
+        }
+        Integer productExists = db.queryForObject(
+            "SELECT COUNT(*) FROM products WHERE id = ?", Integer.class, s.productId());
+        Integer warehouseExists = db.queryForObject(
+            "SELECT COUNT(*) FROM warehouses WHERE id = ?", Integer.class, s.warehouseId());
+        if (productExists == null || productExists == 0 || warehouseExists == null || warehouseExists == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product or warehouse not found.");
+        }
+        db.update("""
+            INSERT INTO inventory(product_id, warehouse_id, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT (product_id, warehouse_id)
+            DO UPDATE SET quantity = EXCLUDED.quantity
+            """, s.productId(), s.warehouseId(), s.quantity());
+        return db.queryForMap("""
+            SELECT i.product_id, p.name AS product, i.warehouse_id,
+                   w.name AS warehouse, i.quantity,
+                   CASE WHEN i.quantity <= 5 THEN TRUE ELSE FALSE END AS low_stock
+            FROM inventory i JOIN products p ON p.id = i.product_id
+            JOIN warehouses w ON w.id = i.warehouse_id
+            WHERE i.product_id = ? AND i.warehouse_id = ?
+            """, s.productId(), s.warehouseId());
+    }
+
+    public record OrderItemRequest(Long productId, Long warehouseId, Integer quantity) {}
+    public record NewOrder(Long customerId, List<OrderItemRequest> items) {}
+    public record StatusRequest(String status) {}
+
+    @PostMapping("/orders")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Transactional
+    public Map<String, Object> createOrder(@RequestBody NewOrder order) {
+        if (order == null || order.customerId() == null || order.items() == null || order.items().isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Select a customer and add at least one item.");
+        }
+        Integer customerExists = db.queryForObject(
+            "SELECT COUNT(*) FROM customers WHERE id = ?", Integer.class, order.customerId());
+        if (customerExists == null || customerExists == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Customer not found.");
+        }
+
+        Set<String> uniqueLines = new HashSet<>();
+        for (OrderItemRequest item : order.items()) {
+            if (item == null || item.productId() == null || item.warehouseId() == null
+                    || item.quantity() == null || item.quantity() <= 0) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Each order item needs a product, warehouse and positive quantity.");
+            }
+            String key = item.productId() + ":" + item.warehouseId();
+            if (!uniqueLines.add(key)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "The same product and warehouse can only appear once per order. Change its quantity on that line.");
+            }
+        }
+
+        // Lock stock rows in a stable order to reduce deadlock risk for concurrent orders.
+        List<OrderItemRequest> sortedItems = new ArrayList<>(order.items());
+        sortedItems.sort((a, b) -> {
+            int productCompare = a.productId().compareTo(b.productId());
+            return productCompare != 0 ? productCompare : a.warehouseId().compareTo(b.warehouseId());
+        });
+
+        BigDecimal total = BigDecimal.ZERO;
+        for (OrderItemRequest item : sortedItems) {
+            List<Map<String, Object>> stockRows = db.queryForList("""
+                SELECT quantity FROM inventory
+                WHERE product_id = ? AND warehouse_id = ?
+                FOR UPDATE
+                """, item.productId(), item.warehouseId());
+            if (stockRows.isEmpty()
+                    || ((Number) stockRows.get(0).get("quantity")).intValue() < item.quantity()) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Insufficient stock for product ID " + item.productId() + " at warehouse ID " + item.warehouseId() + ".");
+            }
+            List<BigDecimal> prices = db.query(
+                "SELECT price FROM products WHERE id = ?",
+                (rs, rowNum) -> rs.getBigDecimal("price"), item.productId());
+            if (prices.isEmpty()) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "A selected product was not found.");
+            }
+            total = total.add(prices.get(0).multiply(BigDecimal.valueOf(item.quantity())));
+        }
+
+        Long orderId = db.queryForObject(
+            "INSERT INTO orders(customer_id, total) VALUES (?, ?) RETURNING id",
+            Long.class, order.customerId(), total);
+
+        for (OrderItemRequest item : sortedItems) {
+            BigDecimal price = db.queryForObject(
+                "SELECT price FROM products WHERE id = ?", BigDecimal.class, item.productId());
+            db.update("""
+                UPDATE inventory SET quantity = quantity - ?
+                WHERE product_id = ? AND warehouse_id = ?
+                """, item.quantity(), item.productId(), item.warehouseId());
+            db.update("""
+                INSERT INTO order_items(order_id, product_id, warehouse_id, quantity, unit_price)
+                VALUES (?, ?, ?, ?, ?)
+                """, orderId, item.productId(), item.warehouseId(), item.quantity(), price);
+        }
+        db.update("INSERT INTO payments(order_id, amount, status) VALUES (?, ?, 'PENDING')", orderId, total);
+        db.update("INSERT INTO shipments(order_id, status) VALUES (?, 'PENDING')", orderId);
+        return Map.of("id", orderId, "total", total, "status", "PENDING");
+    }
+
+    @PatchMapping("/orders/{id}/status")
+    @Transactional
+    public Map<String, Object> updateOrderStatus(@PathVariable long id, @RequestBody StatusRequest request) {
+        if (request == null || request.status() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A target status is required.");
+        }
+        String target = request.status().trim().toUpperCase();
+        List<Map<String, Object>> rows = db.queryForList(
+            "SELECT id, status, total FROM orders WHERE id = ? FOR UPDATE", id);
+        if (rows.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found.");
+        }
+        String current = String.valueOf(rows.get(0).get("status"));
+        BigDecimal total = (BigDecimal) rows.get(0).get("total");
+
+        if ("CANCELLED".equals(target)) {
+            if ("CANCELLED".equals(current) || "SHIPPED".equals(current)) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "This order cannot be cancelled because it is already " + current + ".");
+            }
+            List<Map<String, Object>> lines = db.queryForList("""
+                SELECT product_id, warehouse_id, quantity
+                FROM order_items WHERE order_id = ?
+                """, id);
+            for (Map<String, Object> line : lines) {
+                db.update("""
+                    UPDATE inventory SET quantity = quantity + ?
+                    WHERE product_id = ? AND warehouse_id = ?
+                    """, line.get("quantity"), line.get("product_id"), line.get("warehouse_id"));
+            }
+            db.update("UPDATE payments SET status = 'CANCELLED' WHERE order_id = ?", id);
+            db.update("UPDATE orders SET status = 'CANCELLED' WHERE id = ?", id);
+        } else if ("PAID".equals(target) && "PENDING".equals(current)) {
+            db.update("""
+                INSERT INTO payments(order_id, amount, status, paid_at)
+                VALUES (?, ?, 'PAID', NOW())
+                ON CONFLICT (order_id)
+                DO UPDATE SET amount = EXCLUDED.amount, status = 'PAID', paid_at = NOW()
+                """, id, total);
+            db.update("UPDATE orders SET status = 'PAID' WHERE id = ?", id);
+        } else if ("SHIPPED".equals(target) && "PAID".equals(current)) {
+            db.update("""
+                INSERT INTO shipments(order_id, status, shipped_at)
+                VALUES (?, 'SHIPPED', NOW())
+                ON CONFLICT (order_id)
+                DO UPDATE SET status = 'SHIPPED', shipped_at = NOW()
+                """, id);
+            db.update("UPDATE orders SET status = 'SHIPPED' WHERE id = ?", id);
+        } else {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                "Invalid order transition from " + current + " to " + target + ".");
+        }
+
+        return Map.of("id", id, "status", target);
+    }
+}
