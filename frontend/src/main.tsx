@@ -348,7 +348,7 @@ function App() {
         </form>
       </section>
     </div>}
-    <footer>Smart Inventory · Local development environment</footer>
+    <footer>Smart Inventory · Production environment</footer>
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App />);
